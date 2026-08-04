@@ -1,0 +1,17 @@
+# Hyperparameters for the GroundedVQG reproduction.
+#
+# PAPER-GIVEN (do not change without re-checking the paper):
+similarity_alpha: 0.75       # Eq. 7 interpolation between Jaccard-trigram and GloVe-cosine similarity
+batch_size: 64                # Sec 4.4
+epochs: 128                   # Sec 4.4 -- 128 for VQA, 64 for Visual7W (override with --epochs)
+kn_discount: 0.75              # Kneser-Ney discount d, Sec 3.2
+
+# GAP-FILLED (the paper never states a value; these are documented, swappable defaults):
+learning_rate: 0.0004
+type_selector_hidden: 512
+decoder_hidden: 512
+vocab_min_count: 3
+max_question_len: 20
+grad_clip: 5.0
+num_workers: 2
+bigram_beta: 0.2               # LSTM/bigram joint-decoding interpolation weight, Sec 3.2
