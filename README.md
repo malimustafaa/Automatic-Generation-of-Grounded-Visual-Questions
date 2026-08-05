@@ -54,15 +54,49 @@ diverse region/caption coverage (more "canonical object" boxes, fewer relational
 captions) -- this mainly affects the paper's *coverage/diversity* metrics (Fig. 3), not
 the architecture being tested.
 
+## Fidelity notes: why we train densecap-pytorch ourselves instead of using its pretrained checkpoint
+
+`densecap-pytorch`'s own README points to a pretrained checkpoint on OneDrive/BaiduYun.
+Both turned out to be unreachable in practice:
+- **OneDrive:** the share link resolves to "item deleted or don't have permission" even
+  when signed into a Microsoft account (tried both the `1drv.ms` short link and the
+  resolved `onedrive.live.com/?cid=...` URL that another user confirmed working in
+  [the repo's issue #2](https://github.com/soloist97/densecap-pytorch/issues/2) back in 2022).
+- **BaiduYun:** the file (1.24GB) exceeds what Baidu Netdisk allows anonymous
+  browser downloads without a China-verified account.
+- No Hugging Face mirror, GitHub Release, or other re-host exists (checked directly).
+
+So `notebooks/colab_train.ipynb` (cell 6) trains `densecap-pytorch` itself on Visual
+Genome, using the repo's own `preprocess.py` and a lightly patched copy of its
+`train.py` (`scripts/densecap_train_patched.py`). This does **not** add a new fidelity
+compromise beyond the substitution above -- it's the same code, same architecture,
+same target dataset the author used; the only difference from downloading their weights
+is normal training-run seed variance. The patch itself makes two changes, both purely
+about robustness for a multi-hour Colab job, not the training procedure:
+1. Replaces NVIDIA Apex (`from apex import amp`) with native `torch.cuda.amp` -- Apex
+   predates PyTorch's built-in mixed-precision support and needs a from-source CUDA
+   build, an unnecessary extra failure point.
+2. Adds checkpoint-resume support, which upstream has none of (it only saves on a
+   validation-mAP improvement or at the very end of all epochs -- a Colab disconnect
+   mid-run could otherwise lose everything). Saves an unconditional checkpoint to
+   Drive at the end of every epoch and auto-resumes from it on restart.
+
+Visual Genome's own download (images + region annotations) is a normal, public,
+no-login academic dataset host (`cs.stanford.edu`, `homes.cs.washington.edu`) --
+all four URLs in `scripts/download_visual_genome.sh` were verified live via `curl -I`
+before being used, not guessed.
+
 ## Repo layout
 
 ```
 src/                  core architecture modules (one file per paper component)
-scripts/              data prep: download VQA/Visual7W/COCO/GloVe, run DenseCap, build manifest
+scripts/              data prep: download VQA/Visual7W/COCO/VisualGenome/GloVe,
+                       train+run DenseCap, build manifest
 configs/default.yaml  all hyperparameters, tagged paper-given vs. gap-filled
 eval/evaluate.py      BLEU/METEOR/ROUGE-L via pycocoevalcap, precision + recall/coverage curves
 tests/smoke_test.py   end-to-end pipeline check on tiny synthetic data (no downloads)
-notebooks/colab_train.ipynb   full pipeline for Colab Pro: data prep -> DenseCap -> train -> eval
+notebooks/colab_train.ipynb   full pipeline for Colab Pro: data prep -> train DenseCap
+                               -> generate captions -> train VQG model -> eval
 ```
 
 ## Quickstart (local, smoke test only)
