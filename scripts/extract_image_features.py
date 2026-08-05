@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -21,6 +22,25 @@ PREPROCESS = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+
+
+def open_image_with_retry(img_path: str, attempts: int = 3, delay: float = 1.5):
+    """Reading many small files off a Google Drive FUSE mount at scale is prone to
+    sporadic OSError: [Errno 5] Input/output error on individual files -- not because
+    the file is actually corrupt, just a flaky mount hiccup. A short retry clears most
+    of these; if it still fails after `attempts`, the caller skips this one image
+    rather than crashing the whole run (matches the existing missing-image behavior,
+    just widened from FileNotFoundError to the full OSError family so a transient
+    Drive glitch doesn't take down a run that's otherwise hours into 100k+ images)."""
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            return Image.open(img_path).convert("RGB")
+        except OSError as e:
+            last_err = e
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    raise last_err
 
 
 def main(questions_path: str, image_root: str, out_dir: str, batch_size: int = 32):
@@ -44,9 +64,9 @@ def main(questions_path: str, image_root: str, out_dir: str, batch_size: int = 3
                 continue
             img_path = os.path.join(image_root, filename)
             try:
-                img = Image.open(img_path).convert("RGB")
-            except FileNotFoundError:
-                print(f"[warn] missing image: {img_path}")
+                img = open_image_with_retry(img_path)
+            except OSError as e:
+                print(f"[warn] failed to read {img_path} after retries: {e}")
                 continue
             tensors.append(PREPROCESS(img))
             ids.append(image_id)
