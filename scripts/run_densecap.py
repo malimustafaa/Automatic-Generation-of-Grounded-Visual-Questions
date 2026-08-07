@@ -20,7 +20,17 @@ def run_describe(densecap_repo: str, config_json: str, checkpoint: str,
     """box_per_img=20 (not describe.py's default of 100): the paper draws a handful of
     candidate captions per image (Sec 3.1's confidence-weighted sampling), not the full
     100-box firehose; kept low here to bound the size of the per-image candidate set
-    that src/similarity.py has to score against at training time. Gap-filled, tune freely."""
+    that src/similarity.py has to score against at training time. Gap-filled, tune freely.
+
+    lut_path is passed explicitly (absolute path) rather than relying on describe.py's
+    own default ('./data/VG-regions-dicts-lite.pkl', a RELATIVE path) -- that default
+    only resolves correctly if describe.py's cwd happens to be densecap_repo, which it
+    isn't when launched as a subprocess from here. This bit us for real: a full
+    82,783-image, ~3-hour run completed successfully end-to-end and then crashed on
+    the very last line (saving results, which needs lut_path) because of exactly this,
+    losing the entire run since describe.py holds everything in memory and only writes
+    to disk once, at the end -- there's no incremental/partial save to fall back on."""
+    lut_path = os.path.join(densecap_repo, "data", "VG-regions-dicts-lite.pkl")
     cmd = [
         "python", os.path.join(densecap_repo, "describe.py"),
         "--config_json", config_json,
@@ -28,13 +38,20 @@ def run_describe(densecap_repo: str, config_json: str, checkpoint: str,
         "--img_path", img_dir,
         "--result_dir", result_dir,
         "--box_per_img", str(box_per_img),
+        "--lut_path", lut_path,
         "--verbose",  # without this, describe.py's tqdm progress bar is disabled entirely
         # (`disable=not console_args.verbose`) and nothing prints until the whole run
         # finishes -- describe.py also only writes result.json once, at the very end,
         # after ALL images are processed (no incremental output either way), so
         # --verbose's progress bar is the only way to see this step moving at all.
     ]
-    subprocess.run(cmd, check=True)
+    # Belt-and-suspenders on top of the explicit --lut_path above: run with cwd set to
+    # densecap_repo, matching how upstream itself expects to be invoked (their own docs
+    # assume you've cd'd into the repo first, same as cells 6b/6c already do for
+    # preprocess.py/train.py) -- in case describe.py has any OTHER undiscovered
+    # relative-path assumption, this is cheap insurance against a repeat of the same
+    # multi-hour-run-lost-at-the-last-line failure.
+    subprocess.run(cmd, check=True, cwd=densecap_repo)
 
 
 def reshape_to_candidates(describe_result_path: str, out_path: str, image_id_lookup: dict):
