@@ -28,6 +28,11 @@ def run_describe(densecap_repo: str, config_json: str, checkpoint: str,
         "--img_path", img_dir,
         "--result_dir", result_dir,
         "--box_per_img", str(box_per_img),
+        "--verbose",  # without this, describe.py's tqdm progress bar is disabled entirely
+        # (`disable=not console_args.verbose`) and nothing prints until the whole run
+        # finishes -- describe.py also only writes result.json once, at the very end,
+        # after ALL images are processed (no incremental output either way), so
+        # --verbose's progress bar is the only way to see this step moving at all.
     ]
     subprocess.run(cmd, check=True)
 
