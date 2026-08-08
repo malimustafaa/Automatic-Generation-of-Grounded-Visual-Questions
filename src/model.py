@@ -46,9 +46,14 @@ class GroundedVQGModel(nn.Module):
         type_loss = F.cross_entropy(type_logits, type_target, reduction="none")
 
         B, T, V = question_logits.shape
+        # question_lengths is deliberately kept on CPU by the caller (train.py) because
+        # forward_step's pack_padded_sequence calls require lengths there -- but that
+        # means it needs an explicit device move here, since it's about to divide a
+        # GPU tensor elementwise (the summed cross-entropy loss).
+        lengths = question_lengths.to(question_logits.device).clamp(min=1).float()
         q_loss = F.cross_entropy(
             question_logits.reshape(-1, V), question_target.reshape(-1),
             ignore_index=pad_id, reduction="none",
-        ).view(B, T).sum(dim=1) / (question_lengths.clamp(min=1).float() + 1)  # +1 for the <end> token
+        ).view(B, T).sum(dim=1) / (lengths + 1)  # +1 for the <end> token
 
         return type_loss, q_loss
