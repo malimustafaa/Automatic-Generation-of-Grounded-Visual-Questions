@@ -5,7 +5,8 @@ scripts/prepare_*.py pipeline:
   {
     "image_id": str,
     "candidates": [{"caption": str, "confidence": float}, ...],  # cached DenseCap output
-    "question": str
+    "question": str,
+    "split": "train"|"val"   # the dataset's own official partition
   },
   ...
 ]
@@ -48,11 +49,27 @@ def tokenize(text: str):
 
 
 class VQGJsonDataset(Dataset):
-    def __init__(self, manifest_path: str, features_path: str, vocab: Vocab, max_len: int = 20):
+    def __init__(self, manifest_path: str, features_path: str, vocab: Vocab, max_len: int = 20,
+                 split: str = None, features: dict = None):
+        """split: if given ("train" or "val"), keep only records whose manifest "split"
+        field matches -- see prepare_vqa.py/prepare_visual7w.py/build_manifest.py for
+        where this comes from (the dataset's own official partition, not a custom
+        carve-up). None keeps everything, for callers that don't need the distinction.
+
+        features: pass an already-loaded {image_id_str: array} dict to avoid loading
+        the (possibly large) consolidated .npz twice when constructing both a train
+        and a val VQGJsonDataset from the same features file."""
         with open(manifest_path) as f:
-            self.records = json.load(f)
-        features_npz = np.load(features_path)
-        self.features = {k: features_npz[k] for k in features_npz.files}
+            records = json.load(f)
+        if split is not None:
+            records = [r for r in records if r.get("split", "train") == split]
+        self.records = records
+
+        if features is not None:
+            self.features = features
+        else:
+            features_npz = np.load(features_path)
+            self.features = {k: features_npz[k] for k in features_npz.files}
         self.vocab = vocab
         self.max_len = max_len
 

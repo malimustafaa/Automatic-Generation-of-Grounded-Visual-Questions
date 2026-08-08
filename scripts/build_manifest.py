@@ -9,6 +9,12 @@ excluded when the mismatch is due to detector/NLP-tool error).
 
 manifest.json no longer stores a per-image feature file path (there isn't one anymore --
 just image_id, looked up against the consolidated .npz by src/dataset.py at load time).
+
+Carries through each record's "split" field (VQA's/Visual7W's own official train/val
+partition, set by prepare_vqa.py/prepare_visual7w.py) so train.py can train only on
+the official train portion and hold out val for monitoring, matching paper Sec 4.4
+("hyperparameters were tuned on the validation sets") -- previously this distinction
+was discarded upstream, training on both merged together with nothing held out.
 """
 import argparse
 import json
@@ -35,6 +41,7 @@ def main(questions_path: str, features_path: str, candidates_path: str, out_path
             "image_id": r["image_id"],
             "candidates": candidates_by_image[image_id]["candidates"],
             "question": r["question"],
+            "split": r.get("split", "train"),
         })
 
     with open(out_path, "w") as f:

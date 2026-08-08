@@ -8,6 +8,14 @@ Implements the approximate-EM objective (Eq. 5-7):
      over all candidates in C_i for that image.
   3. The weighted per-instance loss (Eq. 6) is backpropagated with Adam.
 
+Trains only on the dataset's own official "train" split, holding out its official
+"val" split for monitoring -- paper Sec 4.4: hyperparameters "were tuned on the
+validation sets," meaning the dataset's own standard partition, not a from-scratch
+carve-up. Validation loss is computed (no backward pass) at the end of every epoch
+using the same EM-weighted objective as training, so it's a like-for-like comparison
+against the training loss printed alongside it -- if a gap opens up between the two,
+that's the actual overfitting signal, which training loss alone can't show.
+
 Paper-given: Adam optimizer, batch size 64, alpha=0.75 similarity interpolation,
 128 epochs (VQA) / 64 epochs (Visual7W).
 Gap-filled (not stated by the paper): learning rate, hidden sizes (see model.py /
@@ -45,7 +53,9 @@ def compute_em_weights(questions, candidate_lists, emb_sim: EmbeddingSimilarity,
     This was the actual bottleneck (not the model's forward/backward pass, which is
     genuinely small): up to ~1,280 uncached Python-level similarity computations per
     batch. Epoch 1 still pays full cost (nothing cached yet); every epoch after that
-    should be dramatically faster as the cache fills in."""
+    should be dramatically faster as the cache fills in. Shared between train and val
+    batches too -- a (question, caption) text pair's similarity is the same computation
+    regardless of which split it came from."""
     weights = []
     for q, candidates in zip(questions, candidate_lists):
         sims = []
@@ -60,8 +70,11 @@ def compute_em_weights(questions, candidate_lists, emb_sim: EmbeddingSimilarity,
 
 
 def build_vocab_and_idf(manifest_path: str, min_count: int):
+    """Built from the train split only -- val stays genuinely held-out, including from
+    vocabulary/IDF statistics, not just from gradient updates."""
     with open(manifest_path) as f:
         records = json.load(f)
+    records = [r for r in records if r.get("split", "train") == "train"]
     token_lists = []
     for rec in records:
         token_lists.append(tokenize(rec["question"]))
@@ -70,6 +83,42 @@ def build_vocab_and_idf(manifest_path: str, min_count: int):
     vocab = Vocab(min_count=min_count).build(token_lists)
     idf = build_idf(token_lists)
     return vocab, idf
+
+
+def run_batch(batch, model, device, pad_id, start_id, emb_sim, alpha, em_cache):
+    """Shared forward+loss computation for both the training step and validation --
+    identical math either way, so train/val loss are directly comparable. Backward
+    pass and optimizer step happen only in the caller, only during training."""
+    image_feat = batch["image_feat"].to(device)
+    caption_ids = batch["caption_ids"].to(device)
+    caption_lengths = batch["caption_lengths"]
+    decoder_input_ids = batch["decoder_input_ids"].to(device)
+    decoder_target_ids = batch["decoder_target_ids"].to(device)
+    decoder_lengths = batch["decoder_lengths"]
+    type_target = batch["type_target"].to(device)
+
+    type_logits, q_logits = model.forward_step(
+        image_feat, caption_ids, caption_lengths, decoder_input_ids, decoder_lengths, start_id
+    )
+    type_loss, q_loss = GroundedVQGModel.per_instance_loss(
+        type_logits, type_target, q_logits, decoder_target_ids, decoder_lengths, pad_id
+    )
+    em_weight = compute_em_weights(
+        batch["question"], batch["candidate_captions"], emb_sim, alpha, em_cache
+    ).to(device)
+    return (em_weight * (type_loss + q_loss)).mean()
+
+
+@torch.no_grad()
+def run_validation(val_loader, model, device, pad_id, start_id, emb_sim, alpha, em_cache):
+    model.eval()
+    total_loss, n_batches = 0.0, 0
+    for batch in val_loader:
+        loss = run_batch(batch, model, device, pad_id, start_id, emb_sim, alpha, em_cache)
+        total_loss += loss.item()
+        n_batches += 1
+    model.train()
+    return total_loss / max(n_batches, 1)
 
 
 def train(config_path: str, manifest_path: str, features_path: str, glove_path: str, out_dir: str, epochs: int = None):
@@ -94,16 +143,32 @@ def train(config_path: str, manifest_path: str, features_path: str, glove_path: 
         type_hidden=cfg["type_selector_hidden"], decoder_hidden=cfg["decoder_hidden"],
     ).to(device)
 
-    dataset = VQGJsonDataset(manifest_path, features_path, vocab, max_len=cfg["max_question_len"])
-    loader = DataLoader(
-        dataset, batch_size=cfg["batch_size"], shuffle=True,
-        collate_fn=make_collate_fn(vocab.word2idx[PAD]), num_workers=cfg.get("num_workers", 2),
+    # Features loaded once, shared between train/val datasets rather than loading the
+    # (possibly large) consolidated .npz twice.
+    features_npz = np.load(features_path)
+    shared_features = {k: features_npz[k] for k in features_npz.files}
+
+    train_dataset = VQGJsonDataset(manifest_path, features_path, vocab, max_len=cfg["max_question_len"],
+                                    split="train", features=shared_features)
+    val_dataset = VQGJsonDataset(manifest_path, features_path, vocab, max_len=cfg["max_question_len"],
+                                  split="val", features=shared_features)
+    print(f"train: {len(train_dataset)} records, val: {len(val_dataset)} records")
+
+    collate_fn = make_collate_fn(vocab.word2idx[PAD])
+    train_loader = DataLoader(
+        train_dataset, batch_size=cfg["batch_size"], shuffle=True,
+        collate_fn=collate_fn, num_workers=cfg.get("num_workers", 2),
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=cfg["batch_size"], shuffle=False,
+        collate_fn=collate_fn, num_workers=cfg.get("num_workers", 2),
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"])
     n_epochs = epochs or cfg["epochs"]
     pad_id, start_id = vocab.word2idx[PAD], vocab.word2idx[START]
     em_similarity_cache = {}  # persists across all epochs -- see compute_em_weights docstring
+    best_val_loss = float("inf")
 
     for epoch in range(n_epochs):
         t0 = time.time()
@@ -111,29 +176,9 @@ def train(config_path: str, manifest_path: str, features_path: str, glove_path: 
         # Previously silent for an entire epoch at VQA's scale (hundreds of thousands
         # of records / batch_size 64 = thousands of batches) before the first print --
         # indistinguishable from actually being stuck without a per-batch progress bar.
-        pbar = tqdm(loader, desc=f"epoch {epoch+1}/{n_epochs}")
+        pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{n_epochs}")
         for step, batch in enumerate(pbar, start=1):
-            image_feat = batch["image_feat"].to(device)
-            caption_ids = batch["caption_ids"].to(device)
-            caption_lengths = batch["caption_lengths"]
-            decoder_input_ids = batch["decoder_input_ids"].to(device)
-            decoder_target_ids = batch["decoder_target_ids"].to(device)
-            decoder_lengths = batch["decoder_lengths"]
-            type_target = batch["type_target"].to(device)
-
-            type_logits, q_logits = model.forward_step(
-                image_feat, caption_ids, caption_lengths, decoder_input_ids, decoder_lengths, start_id
-            )
-            type_loss, q_loss = GroundedVQGModel.per_instance_loss(
-                type_logits, type_target, q_logits, decoder_target_ids, decoder_lengths, pad_id
-            )
-
-            em_weight = compute_em_weights(
-                batch["question"], batch["candidate_captions"], emb_sim, cfg["similarity_alpha"],
-                em_similarity_cache,
-            ).to(device)
-
-            loss = (em_weight * (type_loss + q_loss)).mean()
+            loss = run_batch(batch, model, device, pad_id, start_id, emb_sim, cfg["similarity_alpha"], em_similarity_cache)
 
             optimizer.zero_grad()
             loss.backward()
@@ -144,11 +189,21 @@ def train(config_path: str, manifest_path: str, features_path: str, glove_path: 
             total_loss += loss.item()
             pbar.set_postfix(avg_loss=f"{total_loss / step:.4f}")
 
-        print(f"[epoch {epoch+1}/{n_epochs}] loss={total_loss / max(len(loader), 1):.4f} "
-              f"({time.time() - t0:.1f}s)")
+        train_loss = total_loss / max(len(train_loader), 1)
+        val_loss = run_validation(val_loader, model, device, pad_id, start_id, emb_sim, cfg["similarity_alpha"], em_similarity_cache)
+        gap = val_loss - train_loss
+        print(f"[epoch {epoch+1}/{n_epochs}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+              f"gap={gap:+.4f} ({time.time() - t0:.1f}s)")
 
         ckpt_path = f"{out_dir}/checkpoint_epoch{epoch+1}.pt"
-        torch.save({"model": model.state_dict(), "vocab": vocab.idx2word, "cfg": cfg}, ckpt_path)
+        torch.save({"model": model.state_dict(), "vocab": vocab.idx2word, "cfg": cfg,
+                    "train_loss": train_loss, "val_loss": val_loss}, ckpt_path)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({"model": model.state_dict(), "vocab": vocab.idx2word, "cfg": cfg,
+                        "train_loss": train_loss, "val_loss": val_loss, "epoch": epoch + 1},
+                       f"{out_dir}/checkpoint_best.pt")
 
 
 if __name__ == "__main__":

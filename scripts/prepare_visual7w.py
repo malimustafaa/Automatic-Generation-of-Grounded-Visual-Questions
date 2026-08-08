@@ -6,7 +6,10 @@ Source: http://ai.stanford.edu/~yukez/papers/resources/dataset_v7w_telling.zip
 Images referenced by Visual7W are MS-COCO images (scripts/download_coco_images.sh).
 
 Output: data/visual7w_questions.json, a list of
-  {"question_id": ..., "image_id": ..., "image_filename": str, "question": str}
+  {"question_id": ..., "image_id": ..., "image_filename": str, "question": str, "split": "train"|"val"|"test"}
+
+"split" is Visual7W's own official partition, embedded per-image in the dataset's own
+schema -- train.py filters on this the same way as prepare_vqa.py's split field.
 """
 import argparse
 import json
@@ -34,12 +37,14 @@ def main(dest_dir: str, coco_dir: str, out_path: str):
         # Visual7W stores COCO filenames directly (or COCO ids for COCO-sourced images);
         # 'filename' is present for the majority of the dataset per the toolkit's schema.
         filename = image.get("filename")
+        split = image.get("split", "train")
         for qa in image.get("qa_pairs", []):
             records.append({
                 "question_id": qa["qa_id"],
                 "image_id": image["image_id"],
                 "image_filename": filename,
                 "question": qa["question"],
+                "split": split,
             })
 
     with open(out_path, "w") as f:

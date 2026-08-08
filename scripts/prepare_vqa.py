@@ -10,7 +10,13 @@ Images: MS-COCO train2014/val2014 (scripts/download_coco_images.sh) -- VQA v1 do
 bundle images itself, only question/annotation JSON referencing COCO image ids.
 
 Output: data/vqa_questions.json, a list of
-  {"question_id": int, "image_id": int, "image_filename": str, "question": str}
+  {"question_id": int, "image_id": int, "image_filename": str, "question": str, "split": "train"|"val"}
+
+"split" is VQA's own official train/val partition (Sec 4.4: hyperparameters "were
+tuned on the validation sets" -- the paper uses the dataset's standard val split for
+this, not a from-scratch carve-up). Previously this distinction was discarded here,
+merging both into one undifferentiated pool with nothing held out from training --
+train.py now filters on this field.
 """
 import argparse
 import json
@@ -53,6 +59,7 @@ def main(dest_dir: str, out_path: str):
                 "image_id": q["image_id"],
                 "image_filename": coco_filename(q["image_id"], coco_split),
                 "question": q["question"],
+                "split": split,
             })
         print(f"[{split}] {len(data['questions'])} questions")
 
