@@ -33,13 +33,27 @@ from src.similarity import EmbeddingSimilarity, build_idf, combined_similarity
 from src.vocab import PAD, START, Vocab
 
 
-def compute_em_weights(questions, candidate_lists, emb_sim: EmbeddingSimilarity, alpha: float):
+def compute_em_weights(questions, candidate_lists, emb_sim: EmbeddingSimilarity, alpha: float, cache: dict):
     """Eq. 7: P(c_n | q, t) = s(q, c_n) / sum_{c_j in C} s(q, c_j), restricted to the
-    single drawn candidate c_n vs. the full candidate set C for that image."""
+    single drawn candidate c_n vs. the full candidate set C for that image.
+
+    `cache` persists across the whole training run (passed in from train(), not
+    recreated per call/epoch). combined_similarity(q, c, ...) is a pure function of
+    the (q, c) text pair -- it doesn't depend on the model or training step at all --
+    but the dataset is fixed across all epochs, so every one of these similarity
+    computations was being redone identically all 128 times before this cache existed.
+    This was the actual bottleneck (not the model's forward/backward pass, which is
+    genuinely small): up to ~1,280 uncached Python-level similarity computations per
+    batch. Epoch 1 still pays full cost (nothing cached yet); every epoch after that
+    should be dramatically faster as the cache fills in."""
     weights = []
     for q, candidates in zip(questions, candidate_lists):
-        q_tokens = tokenize(q)
-        sims = [combined_similarity(q, c, q_tokens, tokenize(c), emb_sim, alpha) for c in candidates]
+        sims = []
+        for c in candidates:
+            key = (q, c)
+            if key not in cache:
+                cache[key] = combined_similarity(q, c, tokenize(q), tokenize(c), emb_sim, alpha)
+            sims.append(cache[key])
         total = sum(sims)
         weights.append(sims[0] / total if total > 0 else 1.0 / len(candidates))
     return torch.tensor(weights, dtype=torch.float32)
@@ -89,6 +103,7 @@ def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, e
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"])
     n_epochs = epochs or cfg["epochs"]
     pad_id, start_id = vocab.word2idx[PAD], vocab.word2idx[START]
+    em_similarity_cache = {}  # persists across all epochs -- see compute_em_weights docstring
 
     for epoch in range(n_epochs):
         t0 = time.time()
@@ -114,7 +129,8 @@ def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, e
             )
 
             em_weight = compute_em_weights(
-                batch["question"], batch["candidate_captions"], emb_sim, cfg["similarity_alpha"]
+                batch["question"], batch["candidate_captions"], emb_sim, cfg["similarity_alpha"],
+                em_similarity_cache,
             ).to(device)
 
             loss = (em_weight * (type_loss + q_loss)).mean()
