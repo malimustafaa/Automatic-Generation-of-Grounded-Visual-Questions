@@ -72,7 +72,7 @@ def build_vocab_and_idf(manifest_path: str, min_count: int):
     return vocab, idf
 
 
-def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, epochs: int = None):
+def train(config_path: str, manifest_path: str, features_path: str, glove_path: str, out_dir: str, epochs: int = None):
     # Without this, the first checkpoint save (after epoch 1, which at VQA's scale
     # could be a genuinely long wait) crashes with FileNotFoundError if out_dir
     # doesn't already exist -- same failure shape as describe.py's lut_path bug:
@@ -94,7 +94,7 @@ def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, e
         type_hidden=cfg["type_selector_hidden"], decoder_hidden=cfg["decoder_hidden"],
     ).to(device)
 
-    dataset = VQGJsonDataset(manifest_path, vocab, max_len=cfg["max_question_len"])
+    dataset = VQGJsonDataset(manifest_path, features_path, vocab, max_len=cfg["max_question_len"])
     loader = DataLoader(
         dataset, batch_size=cfg["batch_size"], shuffle=True,
         collate_fn=make_collate_fn(vocab.word2idx[PAD]), num_workers=cfg.get("num_workers", 2),
@@ -155,8 +155,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--features", required=True, help="consolidated .npz from extract_image_features.py")
     parser.add_argument("--glove", default="data/glove.840B.300d.txt")
     parser.add_argument("--out_dir", default="checkpoints")
     parser.add_argument("--epochs", type=int, default=None)
     args = parser.parse_args()
-    train(args.config, args.manifest, args.glove, args.out_dir, args.epochs)
+    train(args.config, args.manifest, args.features, args.glove, args.out_dir, args.epochs)

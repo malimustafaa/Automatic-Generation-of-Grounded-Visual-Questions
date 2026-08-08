@@ -4,12 +4,18 @@ scripts/prepare_*.py pipeline:
 [
   {
     "image_id": str,
-    "image_feat_path": str,       # path to a precomputed (300,) .npy VGG-16 feature
     "candidates": [{"caption": str, "confidence": float}, ...],  # cached DenseCap output
     "question": str
   },
   ...
 ]
+
+Image features come from a separate consolidated .npz archive (extract_image_features.py),
+loaded ONCE into memory in __init__ rather than one file read per training example --
+that used to be one .npy file per image, re-opened from disk (often a Drive mount) on
+every single batch across all 128 epochs, which caused a real hang once these files
+ended up on Drive (same class of "many small files through Drive's FUSE layer" bug
+already fixed for COCO/Visual Genome images).
 
 Question type (Sec 3.3: 'we can directly extract the question type from the question q
 by looking at the first few words') is derived here from the question's first token.
@@ -42,9 +48,11 @@ def tokenize(text: str):
 
 
 class VQGJsonDataset(Dataset):
-    def __init__(self, manifest_path: str, vocab: Vocab, max_len: int = 20):
+    def __init__(self, manifest_path: str, features_path: str, vocab: Vocab, max_len: int = 20):
         with open(manifest_path) as f:
             self.records = json.load(f)
+        features_npz = np.load(features_path)
+        self.features = {k: features_npz[k] for k in features_npz.files}
         self.vocab = vocab
         self.max_len = max_len
 
@@ -53,7 +61,7 @@ class VQGJsonDataset(Dataset):
 
     def __getitem__(self, idx):
         rec = self.records[idx]
-        image_feat = torch.from_numpy(np.load(rec["image_feat_path"])).float()
+        image_feat = torch.from_numpy(self.features[str(rec["image_id"])]).float()
 
         candidates = rec["candidates"]
         conf = np.array([c.get("confidence", 1.0) for c in candidates], dtype=np.float64)

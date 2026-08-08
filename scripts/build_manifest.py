@@ -1,33 +1,38 @@
 """Merges questions (prepare_vqa.py / prepare_visual7w.py) + image features
-(extract_image_features.py) + DenseCap candidate captions (run_densecap.py) into the
-final manifest.json consumed by src/dataset.py's VQGJsonDataset.
+(extract_image_features.py, ONE consolidated .npz keyed by str(image_id)) + DenseCap
+candidate captions (run_densecap.py) into the final manifest.json consumed by
+src/dataset.py's VQGJsonDataset.
 
 Records without a matched image feature or candidate-caption set are dropped (mirrors
 the paper Sec 4.1 note: image-answer pairs with no aligned visual hints/captions are
 excluded when the mismatch is due to detector/NLP-tool error).
+
+manifest.json no longer stores a per-image feature file path (there isn't one anymore --
+just image_id, looked up against the consolidated .npz by src/dataset.py at load time).
 """
 import argparse
 import json
-import os
+
+import numpy as np
 
 
-def main(questions_path: str, features_dir: str, candidates_path: str, out_path: str):
+def main(questions_path: str, features_path: str, candidates_path: str, out_path: str):
     with open(questions_path) as f:
         records = json.load(f)
     with open(candidates_path) as f:
         candidates_by_image = json.load(f)  # keys are strings after JSON round-trip
+    features = np.load(features_path)
+    feature_keys = set(features.files)
 
     manifest = []
     dropped = 0
     for r in records:
         image_id = str(r["image_id"])
-        feat_path = os.path.join(features_dir, f"{r['image_id']}.npy")
-        if not os.path.exists(feat_path) or image_id not in candidates_by_image:
+        if image_id not in feature_keys or image_id not in candidates_by_image:
             dropped += 1
             continue
         manifest.append({
             "image_id": r["image_id"],
-            "image_feat_path": feat_path,
             "candidates": candidates_by_image[image_id]["candidates"],
             "question": r["question"],
         })
@@ -40,8 +45,8 @@ def main(questions_path: str, features_dir: str, candidates_path: str, out_path:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--questions", required=True)
-    parser.add_argument("--features_dir", required=True)
+    parser.add_argument("--features_path", required=True, help="consolidated .npz from extract_image_features.py")
     parser.add_argument("--candidates", required=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    main(args.questions, args.features_dir, args.candidates, args.out)
+    main(args.questions, args.features_path, args.candidates, args.out)
