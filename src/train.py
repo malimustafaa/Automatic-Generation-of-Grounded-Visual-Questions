@@ -17,6 +17,7 @@ All gap-filled values live in configs/default.yaml, not hardcoded here.
 """
 import argparse
 import json
+import os
 import time
 
 import numpy as np
@@ -58,6 +59,12 @@ def build_vocab_and_idf(manifest_path: str, min_count: int):
 
 
 def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, epochs: int = None):
+    # Without this, the first checkpoint save (after epoch 1, which at VQA's scale
+    # could be a genuinely long wait) crashes with FileNotFoundError if out_dir
+    # doesn't already exist -- same failure shape as describe.py's lut_path bug:
+    # a long run completing successfully and then dying on the save step.
+    os.makedirs(out_dir, exist_ok=True)
+
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
