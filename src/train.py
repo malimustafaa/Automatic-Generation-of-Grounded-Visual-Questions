@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.dataset import VQGJsonDataset, make_collate_fn, tokenize
 from src.embeddings import build_embedding_matrix, load_glove_lookup
@@ -85,7 +86,11 @@ def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, e
     for epoch in range(n_epochs):
         t0 = time.time()
         total_loss = 0.0
-        for batch in loader:
+        # Previously silent for an entire epoch at VQA's scale (hundreds of thousands
+        # of records / batch_size 64 = thousands of batches) before the first print --
+        # indistinguishable from actually being stuck without a per-batch progress bar.
+        pbar = tqdm(loader, desc=f"epoch {epoch+1}/{n_epochs}")
+        for step, batch in enumerate(pbar, start=1):
             image_feat = batch["image_feat"].to(device)
             caption_ids = batch["caption_ids"].to(device)
             caption_lengths = batch["caption_lengths"]
@@ -114,6 +119,7 @@ def train(config_path: str, manifest_path: str, glove_path: str, out_dir: str, e
             optimizer.step()
 
             total_loss += loss.item()
+            pbar.set_postfix(avg_loss=f"{total_loss / step:.4f}")
 
         print(f"[epoch {epoch+1}/{n_epochs}] loss={total_loss / max(len(loader), 1):.4f} "
               f"({time.time() - t0:.1f}s)")
