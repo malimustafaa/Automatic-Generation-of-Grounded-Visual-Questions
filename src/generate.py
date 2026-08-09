@@ -25,6 +25,14 @@ the default so nothing already validated against Fig. 3 changes unless a caller 
 in); beam_width > 1 uses proper beam search (see _beam_search_decode below), which in
 practice produces more coherent completions than greedy on captions the model has weak
 associations for.
+
+Two more opt-in, inference-only knobs (both default off, same "nothing changes for
+Fig. 3 unless a caller opts in" reasoning as beam_width): `dedup_captions` collapses
+DenseCap's often-redundant duplicate-text candidates (see _dedup_captions_by_text)
+before the confidence-weighted caption sampling; `distinct_types` masks out question
+types already used earlier for the same image before sampling the next one, since the
+type-selector's distribution is often skewed enough (~85-90% "what" in practice) that
+independent sampling collapses most/all draws onto the same type.
 """
 from typing import List
 
@@ -38,6 +46,23 @@ from .question_type_selector import QUESTION_TYPES
 from .vocab import END, START, Vocab
 
 TYPE_PREFIXES = {t: [t] for t in QUESTION_TYPES}  # gap-filled: k=1 fixed word per type
+
+
+def _dedup_captions_by_text(candidates: List[dict]) -> List[dict]:
+    """Collapses candidates whose caption text is identical (after case/whitespace
+    normalization) down to one entry -- the highest-confidence copy. DenseCap often
+    proposes several overlapping boxes for the same object and describes them with the
+    exact same caption ("the hand of a person" showing up 6 times among 20 candidates
+    for a single image, in practice); left as-is, confidence-weighted sampling just
+    reproduces that redundancy instead of exploring the image's genuinely distinct
+    content. Only catches exact (normalized) duplicates, not near-duplicates with
+    different wording -- a deliberately narrow, low-risk first pass."""
+    best_by_text = {}
+    for c in candidates:
+        key = c["caption"].strip().lower()
+        if key not in best_by_text or c.get("confidence", 1.0) > best_by_text[key].get("confidence", 1.0):
+            best_by_text[key] = c
+    return list(best_by_text.values())
 
 
 def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserNeyBigram,
@@ -105,14 +130,19 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
 def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserNeyBigram,
                         image_feat: torch.Tensor, candidates: List[dict],
                         num_questions: int = 6, beta: float = 0.2, max_len: int = 20,
-                        beam_width: int = 1, device: str = "cpu") -> List[str]:
+                        beam_width: int = 1, dedup_captions: bool = False,
+                        distinct_types: bool = False, device: str = "cpu") -> List[str]:
     model.eval()
     image_feat = image_feat.to(device).unsqueeze(0)
+
+    if dedup_captions:
+        candidates = _dedup_captions_by_text(candidates)
 
     conf = torch.tensor([c.get("confidence", 1.0) for c in candidates], dtype=torch.float32)
     prior = conf / conf.sum()
 
     questions = []
+    used_types = set()
     for _ in range(num_questions):
         cap_idx = int(torch.multinomial(prior, 1).item())
         caption = candidates[cap_idx]["caption"]
@@ -123,8 +153,27 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
         caption_embeds = model.embedding(caption_ids)
         type_logits = model.type_selector(caption_embeds, caption_lengths)
         type_probs = F.softmax(type_logits, dim=-1).squeeze(0)
-        type_idx = int(torch.multinomial(type_probs, 1).item())
+
+        if distinct_types:
+            # Sampling N independent draws from a type distribution this skewed
+            # (~85-90% "what" in practice) tends to just pick "what" every time --
+            # masking out types already used among this image's earlier draws (and
+            # renormalizing over what's left) forces the N questions to actually cover
+            # different types, while still respecting the per-caption type_probs
+            # ordering among whatever's still available. Cycles (resets used_types)
+            # once all 6 types are exhausted, so num_questions > 6 still works.
+            if len(used_types) >= len(QUESTION_TYPES):
+                used_types = set()
+            mask = torch.tensor([0.0 if t in used_types else 1.0 for t in QUESTION_TYPES])
+            masked_probs = type_probs * mask
+            if masked_probs.sum() > 0:
+                type_idx = int(torch.multinomial(masked_probs / masked_probs.sum(), 1).item())
+            else:
+                type_idx = int(torch.multinomial(type_probs, 1).item())
+        else:
+            type_idx = int(torch.multinomial(type_probs, 1).item())
         qtype = QUESTION_TYPES[type_idx]
+        used_types.add(qtype)
 
         caption_embedding = model.encoder(image_feat, caption_embeds, caption_lengths)
         joint_feature = model.correlation(caption_embedding, image_feat)
