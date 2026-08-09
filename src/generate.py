@@ -85,6 +85,11 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
             prev_word = next_word
             next_input_id = next_id
 
-        questions.append(" ".join(generated) + " ?")
+        # tokenize() treats "?" as its own token, so a well-trained decoder learns to
+        # generate it naturally as the last word before <end> -- appending another one
+        # unconditionally produced "...bedspread ? ?" in practice. Only add it if the
+        # model didn't already.
+        text = " ".join(generated)
+        questions.append(text if generated[-1] == "?" else text + " ?")
 
     return questions
