@@ -29,7 +29,22 @@ def run_densecap_single(densecap_repo: str, config_json: str, checkpoint: str,
     """Same describe.py invocation as scripts/run_densecap.py (explicit --lut_path,
     cwd=densecap_repo, --verbose), just for exactly one image instead of a whole
     directory. Returns the candidate list in this project's format:
-    [{"caption": str, "confidence": float}, ...]."""
+    [{"caption": str, "confidence": float}, ...].
+
+    Checks image_path exists upfront with a specific error message, and captures
+    subprocess output explicitly rather than letting it inherit stdout/stderr --
+    confirmed in practice that a Jupyter/Colab notebook cell doesn't reliably display
+    a subprocess's inherited output on failure (a describe.py crash showed only a bare
+    CalledProcessError, none of the actual Python traceback from inside describe.py
+    itself, even though the exact same command run from a Terminal showed it fine)."""
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(
+            f"Image not found at {image_path!r}. If this came from Colab's "
+            "files.upload(), remember it saves into the notebook's current working "
+            "directory, not necessarily /content/ -- use os.path.abspath(filename) "
+            "rather than assuming a fixed prefix."
+        )
+
     os.makedirs(result_dir, exist_ok=True)
     lut_path = os.path.join(densecap_repo, "data", "VG-regions-dicts-lite.pkl")
     cmd = [
@@ -42,7 +57,12 @@ def run_densecap_single(densecap_repo: str, config_json: str, checkpoint: str,
         "--lut_path", lut_path,
         "--verbose",
     ]
-    subprocess.run(cmd, check=True, cwd=densecap_repo)
+    result = subprocess.run(cmd, cwd=densecap_repo, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"describe.py failed (exit code {result.returncode}).\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
 
     with open(os.path.join(result_dir, "result.json")) as f:
         raw = json.load(f)
