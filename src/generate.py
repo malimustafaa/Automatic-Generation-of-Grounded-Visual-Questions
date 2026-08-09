@@ -73,7 +73,7 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
             probs_lstm = F.softmax(logits, dim=-1).squeeze(0)
 
             bigram_probs = torch.tensor(
-                [bigram_lm.prob(prev_word, w) for w in vocab.idx2word], dtype=torch.float32, device=device
+                bigram_lm.prob_vector(prev_word, vocab.idx2word), dtype=torch.float32, device=device
             )
             combined = (1 - beta) * probs_lstm + beta * bigram_probs
             next_id = int(torch.argmax(combined).item())

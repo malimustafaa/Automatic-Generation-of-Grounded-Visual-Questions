@@ -26,6 +26,7 @@ class KneserNeyBigram:
         self.continuation_counts = defaultdict(set)  # w -> distinct words preceding w
         self.followers = defaultdict(set)             # w_prev -> distinct words following w_prev
         self.total_bigram_types = 1
+        self._prob_vector_cache = {}  # prev_word -> [prob(prev_word, w) for w in vocab], see prob_vector()
 
     def fit(self, token_sequences: List[List[str]]) -> "KneserNeyBigram":
         for seq in token_sequences:
@@ -50,3 +51,16 @@ class KneserNeyBigram:
         n_types_after_prev = len(self.followers.get(w_prev, ()))
         lam = (self.d * n_types_after_prev) / count_prev
         return discounted + lam * self.p_continuation(w)
+
+    def prob_vector(self, prev_word: str, vocab_words: List[str]) -> List[float]:
+        """Full P(w | prev_word) over vocab_words, in that order -- cached per
+        prev_word, since generate.py's decode loop calls this for the SAME prev_word
+        an enormous number of times across a real evaluation run (thousands of images
+        x questions x decode steps, mostly sharing a small set of common prev_words
+        like "the"/"is"/"a"). Without this, every decode step re-ran prob() once per
+        vocabulary word from scratch -- at real eval scale (2000+ images) this was
+        billions of redundant Python-level calls, not just slow but potentially
+        multi-hour slow, for a step that should be near-instant."""
+        if prev_word not in self._prob_vector_cache:
+            self._prob_vector_cache[prev_word] = [self.prob(prev_word, w) for w in vocab_words]
+        return self._prob_vector_cache[prev_word]
