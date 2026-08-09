@@ -29,11 +29,29 @@ def _score_all(gts: Dict[str, List[str]], res: Dict[str, List[str]]) -> Dict[str
     return scores
 
 
+def _score_all_per_key(gts: Dict[str, List[str]], res: Dict[str, List[str]]) -> Dict[str, Dict[str, float]]:
+    """Per-(gts/res)-key scores for each metric, instead of just the aggregate mean --
+    needed by recall_scores' max-reduce-per-reference. All three scorers iterate
+    gts.keys() in order and return per-key results in that same order (confirmed
+    directly against pycocoevalcap's source for Bleu/Meteor/Rouge, and empirically)."""
+    keys = list(gts.keys())
+    per_key = {}
+    _, bleu_scores = Bleu(4).compute_score(gts, res)
+    for n in range(4):
+        per_key[f"BLEU-{n+1}"] = dict(zip(keys, bleu_scores[n]))
+    _, meteor_scores = Meteor().compute_score(gts, res)
+    per_key["METEOR"] = dict(zip(keys, meteor_scores))
+    _, rouge_scores = Rouge().compute_score(gts, res)
+    per_key["ROUGE-L"] = dict(zip(keys, rouge_scores))
+    return per_key
+
+
 def precision_scores(references: Dict[str, List[str]], generated: Dict[str, List[str]]) -> Dict[str, float]:
     """references[image_id] = list of gold questions; generated[image_id] = list of
     generated questions. Each generated question is scored against ALL references for
     that image (pycocoevalcap picks the best match internally, matching the paper's
-    'highest score among all reference questions')."""
+    'highest score among all reference questions') -- this is exactly pycocoevalcap's
+    native N-references-vs-1-hypothesis support, no restructuring needed."""
     gts, res = {}, {}
     for image_id, gens in generated.items():
         refs = references.get(image_id, [])
@@ -47,18 +65,42 @@ def precision_scores(references: Dict[str, List[str]], generated: Dict[str, List
 
 
 def recall_scores(references: Dict[str, List[str]], generated: Dict[str, List[str]]) -> Dict[str, float]:
-    """Swapped roles vs. precision_scores: each *reference* is scored against all
-    generated questions for that image -- an estimate of coverage (paper Sec 4.3)."""
+    """Paper Sec 4.3: for each reference question, compare against EACH generated
+    candidate individually and take the best-matching score -- an estimate of coverage/
+    diversity ('analogy of recall'). This is the reverse of precision_scores' direction,
+    and pycocoevalcap's scorers only support N references vs 1 hypothesis natively, not
+    N hypotheses vs 1 reference -- so this builds one (1 ref, 1 hyp) pair per
+    (reference, candidate) combination, scores everything in one batched call via
+    _score_all_per_key, then max-reduces per reference before averaging across
+    references.
+
+    (Previously this passed all N candidates as a single multi-item "hypothesis" list
+    directly to _score_all, which crashed BLEU's assert(len(hypo) == 1) the moment
+    N > 1 -- i.e. always, since sweep_num_questions calls this with N up to 6.)"""
     gts, res = {}, {}
+    pair_keys_by_ref = defaultdict(list)
     for image_id, refs in references.items():
         gens = generated.get(image_id, [])
         if not refs or not gens:
             continue
         for i, r in enumerate(refs):
-            key = f"{image_id}_{i}"
-            gts[key] = [r]
-            res[key] = gens
-    return _score_all(gts, res)
+            ref_key = f"{image_id}_{i}"
+            for j, g in enumerate(gens):
+                pair_key = f"{ref_key}__{j}"
+                gts[pair_key] = [r]
+                res[pair_key] = [g]
+                pair_keys_by_ref[ref_key].append(pair_key)
+
+    if not gts:
+        return {}
+
+    per_key = _score_all_per_key(gts, res)
+
+    scores = {}
+    for metric, key_scores in per_key.items():
+        best_per_ref = [max(key_scores[pk] for pk in pair_keys) for pair_keys in pair_keys_by_ref.values()]
+        scores[metric] = sum(best_per_ref) / len(best_per_ref)
+    return scores
 
 
 def sweep_num_questions(references: Dict[str, List[str]], generated_pool: Dict[str, List[str]],
