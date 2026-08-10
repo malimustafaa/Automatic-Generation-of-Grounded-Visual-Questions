@@ -201,6 +201,102 @@ def detect_objects_as_candidates(image_path: str, confidence_threshold: float = 
     return candidates
 
 
+def _box_overlap_stats(box_a: Tuple[float, float, float, float],
+                        box_b: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    """Returns (fraction of box_a inside box_b, fraction of box_b inside box_a) --
+    plain intersection-area geometry."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(ix2 - ix1, 0) * max(iy2 - iy1, 0)
+    area_a = max(ax2 - ax1, 0) * max(ay2 - ay1, 0)
+    area_b = max(bx2 - bx1, 0) * max(by2 - by1, 0)
+    contain_a_in_b = inter / area_a if area_a > 0 else 0.0
+    contain_b_in_a = inter / area_b if area_b > 0 else 0.0
+    return contain_a_in_b, contain_b_in_a
+
+
+def _edge_gap(box_a: Tuple[float, float, float, float], box_b: Tuple[float, float, float, float]) -> float:
+    """Straight-line distance between the nearest edges of two boxes -- 0 if they
+    overlap or touch. More robust than center-to-center distance when box sizes
+    differ a lot (e.g. a large horse and a small nearby truck can have distant
+    centers despite their edges nearly touching)."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    dx = max(bx1 - ax2, ax1 - bx2, 0)
+    dy = max(by1 - ay2, ay1 - by2, 0)
+    return (dx ** 2 + dy ** 2) ** 0.5
+
+
+def _relation_phrase(name_a: str, box_a: Tuple[float, float, float, float], area_a: float,
+                      name_b: str, box_b: Tuple[float, float, float, float], area_b: float,
+                      img_w: int, img_h: int) -> Optional[str]:
+    """"a {smaller} on a {larger}" if one box is mostly contained within the other
+    (e.g. a person mostly overlapping a horse/bench -- a decent proxy for "riding"/
+    "sitting on" without needing to actually recognize the action), "a {a} near a
+    {b}" if their edges are close but they don't overlap much, else None. Pure box
+    geometry, no model -- same reliability guarantee as the color/position/size
+    enrichment: this can only be as wrong as the underlying detections themselves."""
+    if name_a == name_b:
+        return None
+    contain_a_in_b, contain_b_in_a = _box_overlap_stats(box_a, box_b)
+
+    if contain_a_in_b > 0.5 and area_a < area_b:
+        return f"a {name_a} on a {name_b}"
+    if contain_b_in_a > 0.5 and area_b < area_a:
+        return f"a {name_b} on a {name_a}"
+
+    if contain_a_in_b < 0.1 and contain_b_in_a < 0.1:
+        diag = (img_w ** 2 + img_h ** 2) ** 0.5
+        gap = _edge_gap(box_a, box_b) / max(diag, 1)
+        if gap < 0.1:
+            return f"a {name_a} near a {name_b}"
+
+    return None
+
+
+def detect_relations_as_candidates(image_path: str, confidence_threshold: float = 0.5,
+                                    device: str = None, max_detections: int = 8,
+                                    max_relations: int = 6) -> List[dict]:
+    """Simple relational captions ("a person on a horse", "a horse near a truck")
+    built from pairwise box geometry between the same detections detect_objects_as_
+    candidates() enriches individually -- see notebooks/colab_train.ipynb cell 10.
+
+    Right now each detection is described in isolation; this is what lets the
+    candidate pool express how two things relate, which is a big part of what makes a
+    question feel "contextually aware" rather than generic ("what color is the X")
+    -- without a new model, without training, just geometry on boxes the detector
+    already produced and already verified are there.
+
+    Limited to the top `max_detections` by confidence (bounds the O(n^2) pair count)
+    and returns at most `max_relations` (highest-confidence pairs first), so a busy
+    image with many detections doesn't flood the candidate pool with low-value
+    combinations."""
+    detections, img = _detect(image_path, confidence_threshold, device)
+    top = sorted(detections, key=lambda d: -d[1])[:max_detections]
+
+    candidates = []
+    seen_pairs = set()
+    for i in range(len(top)):
+        name_a, score_a, box_a = top[i]
+        area_a = max(box_a[2] - box_a[0], 0) * max(box_a[3] - box_a[1], 0)
+        for j in range(i + 1, len(top)):
+            name_b, score_b, box_b = top[j]
+            area_b = max(box_b[2] - box_b[0], 0) * max(box_b[3] - box_b[1], 0)
+            phrase = _relation_phrase(name_a, box_a, area_a, name_b, box_b, area_b, img.width, img.height)
+            if phrase is None:
+                continue
+            key = tuple(sorted((name_a, name_b)))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            candidates.append({"caption": phrase, "confidence": min(score_a, score_b)})
+
+    candidates.sort(key=lambda c: -c["confidence"])
+    return candidates[:max_relations]
+
+
 def build_object_suppression_mask(detected_objects: Set[str], vocab, device: str) -> torch.Tensor:
     """1.0 at vocab positions for the head noun of every COCO class NOT present in
     detected_objects, 0.0 elsewhere -- used by src/generate.py to actively suppress
