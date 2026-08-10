@@ -33,6 +33,15 @@ before the confidence-weighted caption sampling; `distinct_types` masks out ques
 types already used earlier for the same image before sampling the next one, since the
 type-selector's distribution is often skewed enough (~85-90% "what" in practice) that
 independent sampling collapses most/all draws onto the same type.
+
+A third opt-in knob, also defaulting off: `lexical_bias` (see _build_lexical_mask)
+multiplicatively boosts vocab words that literally appear in the sampled caption at
+every decode step. Unlike attention (src/attention_experiment.py), which gives the
+decoder the *ability* to look back at the caption, this doesn't depend on the model
+having learned to use that ability -- tested empirically, attention alone didn't
+reliably stop the decoder from generating nouns absent from every candidate caption
+(e.g. "mouse"/"cake" when nothing in the candidate pool mentioned either). This is a
+blunter, more reliable-by-construction way to cut down on that specific failure mode.
 """
 from typing import List
 
@@ -46,6 +55,32 @@ from .question_type_selector import QUESTION_TYPES
 from .vocab import END, START, Vocab
 
 TYPE_PREFIXES = {t: [t] for t in QUESTION_TYPES}  # gap-filled: k=1 fixed word per type
+
+# Excluded from the lexical bias (see _build_lexical_mask) -- these are already
+# high-probability under the model/bigram LM regardless of caption content, so
+# boosting them further wouldn't help; the bias is meant to concentrate on the
+# informative nouns/adjectives actually worth grounding the question in.
+LEXICAL_BIAS_STOPWORDS = {"a", "an", "the", "is", "of", "on", "in", "at", "to", "and",
+                           "with", "this", "that", "it", "are", "was", "were", "be",
+                           "been", "being", "?"}
+
+
+def _build_lexical_mask(caption_tokens: List[str], vocab: Vocab, device: str) -> torch.Tensor:
+    """1.0 at vocab positions for each content word (not in LEXICAL_BIAS_STOPWORDS)
+    that appears in this specific caption, 0.0 elsewhere. Used by generate_questions'
+    `lexical_bias` to boost words the sampled caption actually mentions at every
+    decode step -- a hard nudge that doesn't depend on the model having *learned* the
+    association, unlike attention (see src/attention_experiment.py), which gives the
+    decoder the *ability* to use the caption but, tested empirically, still doesn't
+    reliably make it do so on an undertrained checkpoint."""
+    mask = torch.zeros(len(vocab.idx2word), device=device)
+    for w in caption_tokens:
+        if w in LEXICAL_BIAS_STOPWORDS:
+            continue
+        idx = vocab.word2idx.get(w)
+        if idx is not None:
+            mask[idx] = 1.0
+    return mask
 
 
 def _dedup_captions_by_text(candidates: List[dict]) -> List[dict]:
@@ -67,7 +102,8 @@ def _dedup_captions_by_text(candidates: List[dict]) -> List[dict]:
 
 def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserNeyBigram,
                          hidden, first_word: str, beam_width: int, max_len: int,
-                         beta: float, device: str) -> List[str]:
+                         beta: float, device: str, lexical_bias: float = 0.0,
+                         lexical_mask: torch.Tensor = None) -> List[str]:
     """Beam search over the same interpolated LSTM+bigram distribution the old greedy
     loop used (paper Sec 3.2's joint-decoding formula), maintaining `beam_width`
     candidate sequences instead of committing to a single argmax word at each step.
@@ -105,7 +141,16 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
             bigram_probs = torch.tensor(
                 bigram_lm.prob_vector(prev_word, vocab.idx2word), dtype=torch.float32, device=device
             )
-            combined = ((1 - beta) * probs_lstm + beta * bigram_probs).clamp(min=1e-12)
+            combined = (1 - beta) * probs_lstm + beta * bigram_probs
+            if lexical_bias > 0 and lexical_mask is not None:
+                # Multiplicative boost, not a blend/replacement -- words the model
+                # already favors keep most of their weight, this just tips close
+                # competition (e.g. "car" vs "mouse", both plausible-ish) toward
+                # whatever the sampled caption actually mentions, without steamrolling
+                # the grammatical/functional words the model needs full control over.
+                combined = combined * (1 + lexical_bias * lexical_mask)
+                combined = combined / combined.sum()
+            combined = combined.clamp(min=1e-12)
             log_probs = torch.log(combined)
 
             k = min(beam_width, log_probs.numel())
@@ -131,7 +176,8 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
                         image_feat: torch.Tensor, candidates: List[dict],
                         num_questions: int = 6, beta: float = 0.2, max_len: int = 20,
                         beam_width: int = 1, dedup_captions: bool = False,
-                        distinct_types: bool = False, device: str = "cpu") -> List[str]:
+                        distinct_types: bool = False, lexical_bias: float = 0.0,
+                        device: str = "cpu") -> List[str]:
     model.eval()
     image_feat = image_feat.to(device).unsqueeze(0)
 
@@ -181,9 +227,12 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
         start_embed = model.embedding(torch.tensor([vocab.word2idx[START]], device=device))
         _, hidden = model.decoder.init_state(joint_feature, start_embed)
 
+        lexical_mask = _build_lexical_mask(caption_tokens, vocab, device) if lexical_bias > 0 else None
+
         first_word = TYPE_PREFIXES[qtype][0]  # k=1 fixed opener, forced regardless of beam_width
         generated = _beam_search_decode(model, vocab, bigram_lm, hidden, first_word,
-                                         beam_width, max_len, beta, device)
+                                         beam_width, max_len, beta, device,
+                                         lexical_bias, lexical_mask)
 
         # tokenize() treats "?" as its own token, so a well-trained decoder learns to
         # generate it naturally as the last word before <end> -- appending another one
