@@ -39,6 +39,21 @@ COCO_INSTANCE_CATEGORY_NAMES = [
     "scissors", "teddy bear", "hair drier", "toothbrush",
 ]
 
+# Informal/alternate words for a COCO class that don't match via the plain
+# last-word heuristic in build_object_suppression_mask -- e.g. "airplane"'s own last
+# (only) word is "airplane", but DenseCap/natural language overwhelmingly say "plane"
+# instead, which slipped through the suppression check entirely as an unrecognized
+# word (confirmed in a real test run: "who took this plane ?" on an image with no
+# plane at all). Deliberately small and hand-picked, not a general synonym system --
+# stays lightweight, only covers cases actually observed or obviously likely.
+COCO_CLASS_SYNONYMS = {
+    "airplane": ["airplane", "plane"],
+    "motorcycle": ["motorcycle", "motorbike"],
+    "couch": ["couch", "sofa"],
+    "tv": ["tv", "television"],
+    "cell phone": ["phone", "cellphone"],
+}
+
 _model = None  # loaded once per process, reused across calls -- same reasoning as
                 # other frozen feature extractors in this codebase (src/image_features.py)
 
@@ -112,8 +127,9 @@ def build_object_suppression_mask(detected_objects: Set[str], vocab, device: str
     for name in COCO_INSTANCE_CATEGORY_NAMES:
         if name in ("__background__", "N/A") or name in detected_objects:
             continue
-        head_noun = name.split()[-1]
-        idx = vocab.word2idx.get(head_noun)
-        if idx is not None:
-            mask[idx] = 1.0
+        words = COCO_CLASS_SYNONYMS.get(name, [name.split()[-1]])
+        for w in words:
+            idx = vocab.word2idx.get(w)
+            if idx is not None:
+                mask[idx] = 1.0
     return mask
