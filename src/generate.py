@@ -34,14 +34,21 @@ types already used earlier for the same image before sampling the next one, sinc
 type-selector's distribution is often skewed enough (~85-90% "what" in practice) that
 independent sampling collapses most/all draws onto the same type.
 
-A third opt-in knob, also defaulting off: `lexical_bias` (see _build_lexical_mask)
-multiplicatively boosts vocab words that literally appear in the sampled caption at
-every decode step. Unlike attention (src/attention_experiment.py), which gives the
-decoder the *ability* to look back at the caption, this doesn't depend on the model
-having learned to use that ability -- tested empirically, attention alone didn't
-reliably stop the decoder from generating nouns absent from every candidate caption
-(e.g. "mouse"/"cake" when nothing in the candidate pool mentioned either). This is a
-blunter, more reliable-by-construction way to cut down on that specific failure mode.
+A third opt-in knob, also defaulting off: `lexical_bias` (see _build_lexical_mask) adds
+a fixed bonus, in LOG-space, to vocab words that literally appear in the sampled
+caption at every decode step, equivalent to multiplying their probability by
+exp(lexical_bias) before renormalizing. Unlike attention (src/attention_experiment.py),
+which gives the decoder the *ability* to look back at the caption, this doesn't depend
+on the model having learned to use that ability -- tested empirically, attention alone
+didn't reliably stop the decoder from generating nouns absent from every candidate
+caption. Log-space (not a multiplicative boost in probability space, which an earlier
+version of this used) matters because a real trained checkpoint's wrong predictions
+can be extremely confident (>99%) -- overriding that needs a boost that scales with how
+confident the wrong prediction is, which only an exponential (log-additive) bonus does;
+a linear-in-probability boost of the same nominal size does essentially nothing against
+a near-saturated softmax. Values in the 5-20 range are reasonable starting points
+(each +1 is another ~2.7x multiplier); how large a value is actually needed depends on
+how dominant the checkpoint's own wrong prediction is for a given image.
 """
 from typing import List
 
@@ -142,16 +149,20 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
                 bigram_lm.prob_vector(prev_word, vocab.idx2word), dtype=torch.float32, device=device
             )
             combined = (1 - beta) * probs_lstm + beta * bigram_probs
-            if lexical_bias > 0 and lexical_mask is not None:
-                # Multiplicative boost, not a blend/replacement -- words the model
-                # already favors keep most of their weight, this just tips close
-                # competition (e.g. "car" vs "mouse", both plausible-ish) toward
-                # whatever the sampled caption actually mentions, without steamrolling
-                # the grammatical/functional words the model needs full control over.
-                combined = combined * (1 + lexical_bias * lexical_mask)
-                combined = combined / combined.sum()
             combined = combined.clamp(min=1e-12)
             log_probs = torch.log(combined)
+            if lexical_bias > 0 and lexical_mask is not None:
+                # Additive in LOG-space (equivalent to a logit bonus), not multiplicative
+                # in probability space -- a fixed additive log-bonus is a *multiplicative*
+                # factor of exp(lexical_bias) on the underlying probability, which scales
+                # with how confident the base prediction is. A merely-multiplicative
+                # probability boost (combined *= (1 + lexical_bias)) turned out to be far
+                # too weak in practice: if the model assigns 95% to a wrong word and
+                # 0.01% to a caption word, even a 16x boost only reaches ~0.16%, nowhere
+                # close to overtaking 95%. exp(lexical_bias) grows fast enough to actually
+                # win that competition with a much smaller, more sane-looking number.
+                log_probs = log_probs + lexical_bias * lexical_mask
+                log_probs = log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
 
             k = min(beam_width, log_probs.numel())
             topk_lp, topk_ids = torch.topk(log_probs, k)
