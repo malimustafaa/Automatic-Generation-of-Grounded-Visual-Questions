@@ -13,7 +13,7 @@ on COCO to ~37 mAP -- no training, no API key required, and it's architecturally
 classic two-stage CNN detector (backbone + region proposal network + ROI heads), not a
 transformer, in the same spirit as everything else in this "lightweight" reproduction.
 """
-from typing import Set
+from typing import List, Set, Tuple
 
 import torch
 import torchvision
@@ -52,23 +52,51 @@ def _get_model(device: str):
 
 
 @torch.no_grad()
-def detect_objects(image_path: str, confidence_threshold: float = 0.5, device: str = None) -> Set[str]:
-    """Returns the set of COCO class names detected in the image above
-    confidence_threshold, e.g. {"person", "banana", "cell phone"}. Excludes the
-    background/N-A placeholder entries."""
+def _detect(image_path: str, confidence_threshold: float, device: str = None) -> List[Tuple[str, float]]:
+    """Runs the detector once, returns [(class_name, score), ...] for every detection
+    above confidence_threshold (excluding background/N-A), one entry per detected box
+    -- not deduped, since e.g. two separate people are each a legitimate detection.
+    Both detect_objects() and detect_objects_as_candidates() derive from this single
+    call so neither duplicates the (cheap, but non-zero) forward pass."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = _get_model(device)
     img = Image.open(image_path).convert("RGB")
     tensor = transforms.ToTensor()(img).to(device)
     pred = model([tensor])[0]
 
-    detected = set()
+    detections = []
     for label, score in zip(pred["labels"].tolist(), pred["scores"].tolist()):
         if score >= confidence_threshold:
             name = COCO_INSTANCE_CATEGORY_NAMES[label]
             if name not in ("__background__", "N/A"):
-                detected.add(name)
-    return detected
+                detections.append((name, score))
+    return detections
+
+
+def detect_objects(image_path: str, confidence_threshold: float = 0.5, device: str = None) -> Set[str]:
+    """Returns the set of COCO class names detected in the image above
+    confidence_threshold, e.g. {"person", "banana", "cell phone"} -- used by
+    src/generate.py's object_suppression_bias."""
+    return {name for name, _ in _detect(image_path, confidence_threshold, device)}
+
+
+def detect_objects_as_candidates(image_path: str, confidence_threshold: float = 0.5,
+                                  device: str = None) -> List[dict]:
+    """Same detections as detect_objects, formatted as candidate dicts
+    ({"caption": "a banana", "confidence": score}) so they can be merged directly into
+    DenseCap's own candidate pool (see notebooks/colab_train.ipynb cell 10).
+
+    DenseCap produces richer natural-language captions ("a woman holding a cell
+    phone") but, trained from scratch, is unreliable about WHAT's actually in the
+    image. This detector is the reverse trade-off: reliable about object identity
+    (COCO-trained to ~37 mAP) but with no relational/descriptive richness beyond a
+    bare noun phrase. Pooling both lets confidence-weighted sampling draw on whichever
+    source is actually right for a given region, and -- unlike object_suppression_bias,
+    which corrects individual word choices *after* the decoder has already committed
+    to a direction -- gives the decoder itself better raw material to generate a
+    fluent sentence around, rather than fighting its output word by word."""
+    return [{"caption": f"a {name}", "confidence": score}
+            for name, score in _detect(image_path, confidence_threshold, device)]
 
 
 def build_object_suppression_mask(detected_objects: Set[str], vocab, device: str) -> torch.Tensor:
