@@ -109,8 +109,7 @@ def _dedup_captions_by_text(candidates: List[dict]) -> List[dict]:
 
 def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserNeyBigram,
                          hidden, first_word: str, beam_width: int, max_len: int,
-                         beta: float, device: str, lexical_bias: float = 0.0,
-                         lexical_mask: torch.Tensor = None) -> List[str]:
+                         beta: float, device: str, bias_vector: torch.Tensor = None) -> List[str]:
     """Beam search over the same interpolated LSTM+bigram distribution the old greedy
     loop used (paper Sec 3.2's joint-decoding formula), maintaining `beam_width`
     candidate sequences instead of committing to a single argmax word at each step.
@@ -151,17 +150,20 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
             combined = (1 - beta) * probs_lstm + beta * bigram_probs
             combined = combined.clamp(min=1e-12)
             log_probs = torch.log(combined)
-            if lexical_bias > 0 and lexical_mask is not None:
+            if bias_vector is not None:
                 # Additive in LOG-space (equivalent to a logit bonus), not multiplicative
                 # in probability space -- a fixed additive log-bonus is a *multiplicative*
-                # factor of exp(lexical_bias) on the underlying probability, which scales
-                # with how confident the base prediction is. A merely-multiplicative
-                # probability boost (combined *= (1 + lexical_bias)) turned out to be far
-                # too weak in practice: if the model assigns 95% to a wrong word and
-                # 0.01% to a caption word, even a 16x boost only reaches ~0.16%, nowhere
-                # close to overtaking 95%. exp(lexical_bias) grows fast enough to actually
-                # win that competition with a much smaller, more sane-looking number.
-                log_probs = log_probs + lexical_bias * lexical_mask
+                # factor of exp(bias) on the underlying probability, which scales with how
+                # confident the base prediction is. A merely-multiplicative probability
+                # boost (combined *= (1 + bias)) turned out to be far too weak in
+                # practice: if the model assigns 95% to a wrong word and 0.01% to a
+                # caption word, even a 16x boost only reaches ~0.16%, nowhere close to
+                # overtaking 95%. exp(bias) grows fast enough to actually win that
+                # competition with a much smaller, more sane-looking number. bias_vector
+                # can carry both a positive component (lexical_bias, for caption words)
+                # and a negative one (object_suppression_bias, for undetected COCO-class
+                # words) added together by the caller -- see generate_questions.
+                log_probs = log_probs + bias_vector
                 log_probs = log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
 
             k = min(beam_width, log_probs.numel())
@@ -188,12 +190,27 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
                         num_questions: int = 6, beta: float = 0.2, max_len: int = 20,
                         beam_width: int = 1, dedup_captions: bool = False,
                         distinct_types: bool = False, lexical_bias: float = 0.0,
+                        object_suppression_bias: float = 0.0, detected_objects=None,
                         device: str = "cpu") -> List[str]:
+    """`object_suppression_bias` + `detected_objects` (a set of COCO class names from
+    src/object_detector.py's detect_objects()) subtract a LOG-space penalty from vocab
+    words that are COCO class names NOT confirmed present in the image by that
+    detector -- directly countering the observed failure mode where the decoder
+    confidently generates a common COCO object word (bird, mouse, cake, vase,
+    scissors, banana, ...) regardless of caption or image content. Composes with
+    lexical_bias in the same bias_vector: a caption word that's also an unconfirmed
+    COCO class gets both the positive and negative contribution, so the two signals
+    can reinforce or partially cancel depending on whether they agree."""
     model.eval()
     image_feat = image_feat.to(device).unsqueeze(0)
 
     if dedup_captions:
         candidates = _dedup_captions_by_text(candidates)
+
+    suppression_mask = None
+    if object_suppression_bias > 0 and detected_objects is not None:
+        from .object_detector import build_object_suppression_mask
+        suppression_mask = build_object_suppression_mask(detected_objects, vocab, device)
 
     conf = torch.tensor([c.get("confidence", 1.0) for c in candidates], dtype=torch.float32)
     prior = conf / conf.sum()
@@ -238,12 +255,16 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
         start_embed = model.embedding(torch.tensor([vocab.word2idx[START]], device=device))
         _, hidden = model.decoder.init_state(joint_feature, start_embed)
 
-        lexical_mask = _build_lexical_mask(caption_tokens, vocab, device) if lexical_bias > 0 else None
+        bias_vector = None
+        if lexical_bias > 0:
+            bias_vector = lexical_bias * _build_lexical_mask(caption_tokens, vocab, device)
+        if suppression_mask is not None:
+            penalty = object_suppression_bias * suppression_mask
+            bias_vector = (bias_vector - penalty) if bias_vector is not None else -penalty
 
         first_word = TYPE_PREFIXES[qtype][0]  # k=1 fixed opener, forced regardless of beam_width
         generated = _beam_search_decode(model, vocab, bigram_lm, hidden, first_word,
-                                         beam_width, max_len, beta, device,
-                                         lexical_bias, lexical_mask)
+                                         beam_width, max_len, beta, device, bias_vector)
 
         # tokenize() treats "?" as its own token, so a well-trained decoder learns to
         # generate it naturally as the last word before <end> -- appending another one
