@@ -49,6 +49,15 @@ a linear-in-probability boost of the same nominal size does essentially nothing 
 a near-saturated softmax. Values in the 5-20 range are reasonable starting points
 (each +1 is another ~2.7x multiplier); how large a value is actually needed depends on
 how dominant the checkpoint's own wrong prediction is for a given image.
+
+`no_repeat_content_words` (default off) blocks a content word from being generated
+twice within the same question. Needed because lexical_bias/object_suppression_bias
+apply the SAME flat bonus/penalty at every decode step with no memory of what's
+already been generated -- confirmed empirically to produce degenerate loops like
+"where is the white white white white ... ?" once one word wins a position strongly
+enough, since nothing otherwise discourages it from winning every position after that
+too. Stopwords (LEXICAL_BIAS_STOPWORDS) are exempt, since legitimately repeating "the"
+or "is" within a question is normal.
 """
 from typing import List
 
@@ -109,7 +118,8 @@ def _dedup_captions_by_text(candidates: List[dict]) -> List[dict]:
 
 def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserNeyBigram,
                          hidden, first_word: str, beam_width: int, max_len: int,
-                         beta: float, device: str, bias_vector: torch.Tensor = None) -> List[str]:
+                         beta: float, device: str, bias_vector: torch.Tensor = None,
+                         no_repeat_content_words: bool = False) -> List[str]:
     """Beam search over the same interpolated LSTM+bigram distribution the old greedy
     loop used (paper Sec 3.2's joint-decoding formula), maintaining `beam_width`
     candidate sequences instead of committing to a single argmax word at each step.
@@ -166,6 +176,21 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
                 log_probs = log_probs + bias_vector
                 log_probs = log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
 
+            if no_repeat_content_words:
+                # bias_vector applies the SAME flat bonus at every single step,
+                # regardless of what's already been generated -- with no memory of the
+                # sequence so far, a word that wins one position tends to keep winning
+                # every position after it too (nothing in the base decoder or bigram LM
+                # strongly discourages self-repetition), producing degenerate loops like
+                # "white white white white..." in practice. This blocks a content word
+                # (not stopwords -- "the color of the car" legitimately repeats "the")
+                # from being generated twice within the same question.
+                used = {w for w in tokens if w not in LEXICAL_BIAS_STOPWORDS}
+                repeat_ids = [vocab.word2idx[w] for w in used if w in vocab.word2idx]
+                if repeat_ids:
+                    log_probs = log_probs.clone()
+                    log_probs[repeat_ids] = float("-inf")
+
             k = min(beam_width, log_probs.numel())
             topk_lp, topk_ids = torch.topk(log_probs, k)
             for lp, idx in zip(topk_lp.tolist(), topk_ids.tolist()):
@@ -191,6 +216,7 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
                         beam_width: int = 1, dedup_captions: bool = False,
                         distinct_types: bool = False, lexical_bias: float = 0.0,
                         object_suppression_bias: float = 0.0, detected_objects=None,
+                        no_repeat_content_words: bool = False,
                         device: str = "cpu") -> List[str]:
     """`object_suppression_bias` + `detected_objects` (a set of COCO class names from
     src/object_detector.py's detect_objects()) subtract a LOG-space penalty from vocab
@@ -264,7 +290,8 @@ def generate_questions(model: GroundedVQGModel, vocab: Vocab, bigram_lm: KneserN
 
         first_word = TYPE_PREFIXES[qtype][0]  # k=1 fixed opener, forced regardless of beam_width
         generated = _beam_search_decode(model, vocab, bigram_lm, hidden, first_word,
-                                         beam_width, max_len, beta, device, bias_vector)
+                                         beam_width, max_len, beta, device, bias_vector,
+                                         no_repeat_content_words)
 
         # tokenize() treats "?" as its own token, so a well-trained decoder learns to
         # generate it naturally as the last word before <end> -- appending another one
