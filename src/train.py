@@ -22,6 +22,15 @@ Gap-filled (not stated by the paper): learning rate, hidden sizes (see model.py 
 correlation.py / decoder.py docstrings), vocab cutoff, dropout, gradient clipping,
 beta (bigram/LSTM interpolation weight, used only at inference in generate.py).
 All gap-filled values live in configs/default.yaml, not hardcoded here.
+
+--early_stopping_patience (default off) stops a run once val_loss hasn't improved
+for that many epochs, instead of always running the full epoch count. Left off by
+default so the paper-faithful 128/64-epoch counts are never silently cut short --
+those are paper-given, not gap-filled. Worth having available for non-paper-faithful
+runs (e.g. the BLIP-candidate retrain, notebooks/colab_train.ipynb cell 33): the
+original run's own numbers already showed why -- val_loss's best epoch was 7 of 128,
+so the other 121 epochs of GPU time produced a strictly worse checkpoint_best.pt than
+what epoch 7 already saved, for zero benefit.
 """
 import argparse
 import json
@@ -121,7 +130,8 @@ def run_validation(val_loader, model, device, pad_id, start_id, emb_sim, alpha, 
     return total_loss / max(n_batches, 1)
 
 
-def train(config_path: str, manifest_path: str, features_path: str, glove_path: str, out_dir: str, epochs: int = None):
+def train(config_path: str, manifest_path: str, features_path: str, glove_path: str, out_dir: str,
+          epochs: int = None, early_stopping_patience: int = None):
     # Without this, the first checkpoint save (after epoch 1, which at VQA's scale
     # could be a genuinely long wait) crashes with FileNotFoundError if out_dir
     # doesn't already exist -- same failure shape as describe.py's lut_path bug:
@@ -169,6 +179,7 @@ def train(config_path: str, manifest_path: str, features_path: str, glove_path: 
     pad_id, start_id = vocab.word2idx[PAD], vocab.word2idx[START]
     em_similarity_cache = {}  # persists across all epochs -- see compute_em_weights docstring
     best_val_loss = float("inf")
+    epochs_since_improvement = 0
 
     for epoch in range(n_epochs):
         t0 = time.time()
@@ -201,9 +212,26 @@ def train(config_path: str, manifest_path: str, features_path: str, glove_path: 
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_since_improvement = 0
             torch.save({"model": model.state_dict(), "vocab": vocab.idx2word, "cfg": cfg,
                         "train_loss": train_loss, "val_loss": val_loss, "epoch": epoch + 1},
                        f"{out_dir}/checkpoint_best.pt")
+        else:
+            epochs_since_improvement += 1
+
+        # Opt-in (default None = disabled, exactly the paper-given epoch count runs
+        # to completion regardless of val_loss, unchanged from before this was added)
+        # -- the paper states 128 epochs (VQA) / 64 (Visual7W) explicitly, not as a
+        # gap-filled value, so this must never silently cut a paper-faithful run
+        # short. Added because the ORIGINAL run's own numbers showed exactly why it's
+        # worth having available: val_loss's best epoch was 7 of 128 -- the other 121
+        # epochs of GPU time produced a strictly worse checkpoint_best.pt than what
+        # was already saved, for zero benefit.
+        if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
+            print(f"[early stopping] val_loss hasn't improved for {epochs_since_improvement} epochs "
+                  f"(patience={early_stopping_patience}) -- stopping at epoch {epoch+1}/{n_epochs}. "
+                  f"checkpoint_best.pt is already the best epoch seen ({epoch+1 - epochs_since_improvement}).")
+            break
 
 
 if __name__ == "__main__":
@@ -214,5 +242,11 @@ if __name__ == "__main__":
     parser.add_argument("--glove", default="data/glove.840B.300d.txt")
     parser.add_argument("--out_dir", default="checkpoints")
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--early_stopping_patience", type=int, default=None,
+                         help="stop once val_loss hasn't improved for this many epochs. Default "
+                              "(unset) runs the full --epochs/config count regardless, matching the "
+                              "paper's explicitly-stated epoch counts exactly -- opt in explicitly "
+                              "for a non-paper-faithful run (e.g. the BLIP retrain).")
     args = parser.parse_args()
-    train(args.config, args.manifest, args.features, args.glove, args.out_dir, args.epochs)
+    train(args.config, args.manifest, args.features, args.glove, args.out_dir,
+          args.epochs, args.early_stopping_patience)
