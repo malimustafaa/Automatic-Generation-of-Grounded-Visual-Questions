@@ -217,6 +217,25 @@ def _box_overlap_stats(box_a: Tuple[float, float, float, float],
     return contain_a_in_b, contain_b_in_a
 
 
+# "on" is only asserted for class pairs where a physically plausible support/mount
+# relationship actually exists -- pure 2D box overlap can't distinguish "genuinely
+# stacked" (a person on a horse) from "just overlaps in the projection because the
+# camera happens to line them up" (a tv behind a person's head reads as "contained"
+# in 2D despite being nowhere near the person physically). Confirmed in a real test:
+# "a tv on a person", "a book on a person" for a desk/office scene where nothing was
+# actually stacked. Deliberately small and hand-picked, not exhaustive.
+PLAUSIBLE_ON_PAIRS = {
+    frozenset({"person", "horse"}), frozenset({"person", "bicycle"}),
+    frozenset({"person", "motorcycle"}), frozenset({"person", "bench"}),
+    frozenset({"person", "chair"}), frozenset({"person", "couch"}),
+    frozenset({"person", "skateboard"}), frozenset({"person", "surfboard"}),
+    frozenset({"person", "snowboard"}), frozenset({"person", "skis"}),
+    frozenset({"person", "bed"}), frozenset({"cat", "couch"}), frozenset({"cat", "bed"}),
+    frozenset({"cat", "chair"}), frozenset({"dog", "couch"}), frozenset({"dog", "bed"}),
+    frozenset({"dog", "chair"}), frozenset({"bird", "bench"}),
+}
+
+
 def _edge_gap(box_a: Tuple[float, float, float, float], box_b: Tuple[float, float, float, float]) -> float:
     """Straight-line distance between the nearest edges of two boxes -- 0 if they
     overlap or touch. More robust than center-to-center distance when box sizes
@@ -241,10 +260,11 @@ def _relation_phrase(name_a: str, box_a: Tuple[float, float, float, float], area
     if name_a == name_b:
         return None
     contain_a_in_b, contain_b_in_a = _box_overlap_stats(box_a, box_b)
+    plausible_on = frozenset({name_a, name_b}) in PLAUSIBLE_ON_PAIRS
 
-    if contain_a_in_b > 0.5 and area_a < area_b:
+    if plausible_on and contain_a_in_b > 0.5 and area_a < area_b:
         return f"a {name_a} on a {name_b}"
-    if contain_b_in_a > 0.5 and area_b < area_a:
+    if plausible_on and contain_b_in_a > 0.5 and area_b < area_a:
         return f"a {name_b} on a {name_a}"
 
     if contain_a_in_b < 0.1 and contain_b_in_a < 0.1:
