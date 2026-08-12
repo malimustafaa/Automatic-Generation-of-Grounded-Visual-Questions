@@ -26,7 +26,7 @@ class KneserNeyBigram:
         self.continuation_counts = defaultdict(set)  # w -> distinct words preceding w
         self.followers = defaultdict(set)             # w_prev -> distinct words following w_prev
         self.total_bigram_types = 1
-        self._prob_vector_cache = {}  # prev_word -> [prob(prev_word, w) for w in vocab], see prob_vector()
+        self._prob_vector_cache = {}  # (prev_word, id(vocab_words)) -> [prob(prev_word, w) for w in vocab], see prob_vector()
 
     def fit(self, token_sequences: List[List[str]]) -> "KneserNeyBigram":
         for seq in token_sequences:
@@ -54,13 +54,25 @@ class KneserNeyBigram:
 
     def prob_vector(self, prev_word: str, vocab_words: List[str]) -> List[float]:
         """Full P(w | prev_word) over vocab_words, in that order -- cached per
-        prev_word, since generate.py's decode loop calls this for the SAME prev_word
-        an enormous number of times across a real evaluation run (thousands of images
-        x questions x decode steps, mostly sharing a small set of common prev_words
-        like "the"/"is"/"a"). Without this, every decode step re-ran prob() once per
-        vocabulary word from scratch -- at real eval scale (2000+ images) this was
-        billions of redundant Python-level calls, not just slow but potentially
-        multi-hour slow, for a step that should be near-instant."""
-        if prev_word not in self._prob_vector_cache:
-            self._prob_vector_cache[prev_word] = [self.prob(prev_word, w) for w in vocab_words]
-        return self._prob_vector_cache[prev_word]
+        (prev_word, vocab identity), since generate.py's decode loop calls this for
+        the SAME prev_word an enormous number of times across a real evaluation run
+        (thousands of images x questions x decode steps, mostly sharing a small set
+        of common prev_words like "the"/"is"/"a"). Without this, every decode step
+        re-ran prob() once per vocabulary word from scratch -- at real eval scale
+        (2000+ images) this was billions of redundant Python-level calls, not just
+        slow but potentially multi-hour slow, for a step that should be near-instant.
+
+        Keyed on id(vocab_words), not just prev_word: this same KneserNeyBigram
+        instance can legitimately be reused across two DIFFERENT models/vocabs (e.g.
+        comparing a paper-faithful checkpoint against a retrained one that has its own
+        differently-sized vocab, in the same session) -- the underlying bigram counts
+        don't depend on which vocab is asking, but a cached vector computed for one
+        vocab's word list is silently wrong-sized (or just wrong) for a different
+        one. This was a real bug, caught when reusing bigram_lm across a 7109-word
+        and a 4212-word vocab in the same session produced a tensor-size mismatch
+        crash rather than a silently wrong answer -- easy to miss if the two vocabs
+        happen to be the same size instead."""
+        cache_key = (prev_word, id(vocab_words))
+        if cache_key not in self._prob_vector_cache:
+            self._prob_vector_cache[cache_key] = [self.prob(prev_word, w) for w in vocab_words]
+        return self._prob_vector_cache[cache_key]
