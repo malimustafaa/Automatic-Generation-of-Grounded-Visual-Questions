@@ -68,7 +68,7 @@ from .bigram_lm import KneserNeyBigram
 from .dataset import tokenize
 from .model import GroundedVQGModel
 from .question_type_selector import QUESTION_TYPES
-from .vocab import END, START, Vocab
+from .vocab import END, PAD, START, UNK, Vocab
 
 TYPE_PREFIXES = {t: [t] for t in QUESTION_TYPES}  # gap-filled: k=1 fixed word per type
 
@@ -143,6 +143,20 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
     active = [([first_word], first_word, hidden, 0.0)]
     finished = []
 
+    # Always masked out, unconditionally -- <pad>/<start>/<unk> are internal
+    # bookkeeping tokens, never a legitimate word in a generated question. An
+    # undertrained checkpoint can otherwise pick <unk> (or, rarely, <pad>/<start>) as
+    # its argmax choice for a word it has weak confidence in, leaking it into the
+    # visible output text (seen repeatedly in practice, e.g. "what is <start> <start>
+    # mouse <start> ?"). Beyond just looking wrong, this crashed a real Fig.
+    # 3-style eval run: pycocoevalcap's METEOR scorer talks to a Java subprocess over
+    # a line-based text protocol, and a generated question containing "<...>" tokens
+    # desynced it, corrupting every subsequent score in that batch. <end> is
+    # deliberately NOT masked here -- it's the legitimate termination signal, handled
+    # separately below (a beam that emits it moves to `finished` rather than being
+    # treated as a visible word at all).
+    special_token_ids = [vocab.word2idx[t] for t in (PAD, START, UNK) if t in vocab.word2idx]
+
     steps_remaining = max_len - len(active[0][0])
     for _ in range(steps_remaining):
         if not active:
@@ -160,6 +174,9 @@ def _beam_search_decode(model: GroundedVQGModel, vocab: Vocab, bigram_lm: Kneser
             combined = (1 - beta) * probs_lstm + beta * bigram_probs
             combined = combined.clamp(min=1e-12)
             log_probs = torch.log(combined)
+            if special_token_ids:
+                log_probs = log_probs.clone()
+                log_probs[special_token_ids] = float("-inf")
             if bias_vector is not None:
                 # Additive in LOG-space (equivalent to a logit bonus), not multiplicative
                 # in probability space -- a fixed additive log-bonus is a *multiplicative*
