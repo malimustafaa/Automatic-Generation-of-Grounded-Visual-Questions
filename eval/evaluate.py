@@ -19,6 +19,23 @@ from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 
 
+def _clean(text: str) -> str:
+    """Meteor talks to its Java subprocess over a line-based stdin/stdout protocol
+    (SCORE ||| ref ||| ... ||| hyp, one line in, one line out -- see pycocoevalcap's
+    meteor.py). pycocoevalcap only strips '|||' from the hypothesis side before
+    building that line, never from references, and strips nothing else at all. Any
+    embedded newline/carriage-return -- or a literal '|||' in a REFERENCE -- turns one
+    logical line into extra lines on the wire, which desyncs every subsequent
+    stdout.readline() for the rest of that compute_score() batch (surfaced as
+    Meteor reading back a raw per-ngram stats line, e.g. '6.0 9.0 4.0 ...', where it
+    expected a single aggregate float score). References here are raw crowdsourced
+    VQA/Visual7w text (scripts/prepare_vqa.py / prepare_visual7w.py take q['question']
+    verbatim, no stripping), so this isn't hypothetical. Same class of bug already
+    hit once on the generated-text side -- see src/generate.py's special_token_ids
+    comment -- this covers the reference side, which was never sanitized."""
+    return " ".join(text.replace("|||", " ").split())
+
+
 def _score_all(gts: Dict[str, List[str]], res: Dict[str, List[str]]) -> Dict[str, float]:
     scores = {}
     bleu_scores, _ = Bleu(4).compute_score(gts, res)
@@ -59,8 +76,8 @@ def precision_scores(references: Dict[str, List[str]], generated: Dict[str, List
             continue
         for i, g in enumerate(gens):
             key = f"{image_id}_{i}"
-            gts[key] = refs
-            res[key] = [g]
+            gts[key] = [_clean(r) for r in refs]
+            res[key] = [_clean(g)]
     return _score_all(gts, res)
 
 
@@ -87,8 +104,8 @@ def recall_scores(references: Dict[str, List[str]], generated: Dict[str, List[st
             ref_key = f"{image_id}_{i}"
             for j, g in enumerate(gens):
                 pair_key = f"{ref_key}__{j}"
-                gts[pair_key] = [r]
-                res[pair_key] = [g]
+                gts[pair_key] = [_clean(r)]
+                res[pair_key] = [_clean(g)]
                 pair_keys_by_ref[ref_key].append(pair_key)
 
     if not gts:
